@@ -274,6 +274,13 @@ export async function createOpenAICompatStream(
   request: OpenAIChatRequest,
   signal?: AbortSignal,
 ): Promise<ReadableStreamDefaultReader<Uint8Array>> {
+  // 1. 复制 request 并构造 payload
+  const payload: Record<string, any> = { ...request, stream: true }
+
+  // 2. 移除兼容性问题字段 (防止严格校验的 API 如 Gemini 报错)
+  delete payload.enable_thinking
+  delete payload.thinking_budget
+
   const response = await (config.fetch ?? globalThis.fetch)(
     joinBaseUrl(config.baseURL, '/chat/completions'),
     {
@@ -284,7 +291,7 @@ export async function createOpenAICompatStream(
         authorization: `Bearer ${config.apiKey}`,
         ...config.headers,
       },
-      body: JSON.stringify({ ...request, stream: true }),
+      body: JSON.stringify(payload),
     },
   )
 
