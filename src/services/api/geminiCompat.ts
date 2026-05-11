@@ -103,16 +103,65 @@ function getToolNameById(messages: BetaMessageParam[]): Map<string, string> {
   return toolNameById
 }
 
+// === 新增：过滤 Gemini 不支持的 JSON Schema 字段 ===
+function sanitizeParameters(params: unknown, isPropertyMap = false): unknown {
+  if (params === null || typeof params !== 'object') return params
+
+  if (Array.isArray(params)) {
+    return params.map(item => sanitizeParameters(item, false))
+  }
+
+  const result: Record<string, unknown> = {}
+  const obj = params as Record<string, unknown>
+
+  for (const [key, value] of Object.entries(obj)) {
+    if (isPropertyMap) {
+      // 当前在 properties 字典中，key 是参数名，不能被当成 Schema 关键字过滤掉
+      result[key] = sanitizeParameters(value, false)
+      continue
+    }
+
+    // 移除 Gemini 不支持的 Schema 字段
+    if (
+      key === '$schema' ||
+      key === 'additionalProperties' ||
+      key === 'propertyNames' ||
+      key === 'exclusiveMinimum' ||
+      key === 'exclusiveMaximum' ||
+      key === 'title' ||
+      key === 'default' ||
+      key === 'pattern'
+    ) {
+      continue
+    }
+
+    // 将 const 转换为 Gemini 支持的 enum
+    if (key === 'const') {
+      result['enum'] =[value]
+      continue
+    }
+
+    // 如果遇到了 properties 字段，它的值是一个字典，里面的 key 是参数名
+    if (key === 'properties' && value !== null && typeof value === 'object' && !Array.isArray(value)) {
+      result[key] = sanitizeParameters(value, true)
+    } else {
+      result[key] = sanitizeParameters(value, false)
+    }
+  }
+
+  return result
+}
+
 function getGeminiToolDefinitions(tools?: BetaToolUnion[]): GeminiTool[] | undefined {
   const definitions = getToolDefinitions(tools)
   if (!definitions || definitions.length === 0) return undefined
 
-  return [
+  return[
     {
       functionDeclarations: definitions.map(tool => ({
         name: tool.function.name,
         description: tool.function.description,
-        parameters: tool.function.parameters,
+        parameters: sanitizeParameters(tool.function.parameters),
       })),
     },
   ]
@@ -153,7 +202,7 @@ function mapEffortToGeminiThinkingBudget(effort?: EffortValue): number | undefin
 function mapAnthropicUserBlocksToGeminiParts(blocks: AnyBlock[]): GeminiPart[] {
   return blocks.flatMap(block => {
     if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
-      return [{ text: block.text }]
+      return[{ text: block.text }]
     }
     if (
       block.type === 'image' &&
@@ -163,14 +212,14 @@ function mapAnthropicUserBlocksToGeminiParts(blocks: AnyBlock[]): GeminiPart[] {
       typeof (block.source as Record<string, unknown>).media_type === 'string' &&
       typeof (block.source as Record<string, unknown>).data === 'string'
     ) {
-      return [{
+      return[{
         inlineData: {
           mimeType: String((block.source as Record<string, unknown>).media_type),
           data: String((block.source as Record<string, unknown>).data),
         },
       }]
     }
-    return []
+    return[]
   })
 }
 
@@ -189,7 +238,7 @@ export function convertAnthropicRequestToGemini(input: {
   effort?: EffortValue
 }): GeminiRequest {
   const toolNameById = getToolNameById(input.messages)
-  const contents: GeminiContent[] = []
+  const contents: GeminiContent[] =[]
   const configuredModel = process.env.ANTHROPIC_MODEL?.trim()
   void configuredModel
 
@@ -207,7 +256,7 @@ export function convertAnthropicRequestToGemini(input: {
     const blocks = toBlocks(message.content)
 
     if (message.role === 'user') {
-      const parts: GeminiPart[] = []
+      const parts: GeminiPart[] =[]
 
       for (const block of blocks as AnyBlock[]) {
         if (block.type === 'tool_result') {
@@ -240,10 +289,10 @@ export function convertAnthropicRequestToGemini(input: {
       continue
     }
 
-    const parts: GeminiPart[] = []
+    const parts: GeminiPart[] =[]
     const assistantBlocks = Array.isArray(message.content)
       ? (message.content as unknown as AnyBlock[])
-      : []
+      :[]
 
     for (const block of assistantBlocks) {
       if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
@@ -400,7 +449,7 @@ export async function* createAnthropicStreamFromGemini(input: {
               type: 'message',
               role: 'assistant',
               model: input.model,
-              content: [],
+              content:[],
               stop_reason: null,
               stop_sequence: null,
               usage: {
@@ -412,7 +461,7 @@ export async function* createAnthropicStreamFromGemini(input: {
         }
 
         const candidate = chunk.candidates?.[0]
-        const parts = candidate?.content?.parts ?? []
+        const parts = candidate?.content?.parts ??[]
 
         for (const part of parts) {
           if (typeof part.text === 'string' && part.text.length > 0 && part.thought) {
