@@ -103,7 +103,6 @@ function getToolNameById(messages: BetaMessageParam[]): Map<string, string> {
   return toolNameById
 }
 
-// === 新增：过滤 Gemini 不支持的 JSON Schema 字段 ===
 function sanitizeParameters(params: unknown, isPropertyMap = false): unknown {
   if (params === null || typeof params !== 'object') return params
 
@@ -116,12 +115,10 @@ function sanitizeParameters(params: unknown, isPropertyMap = false): unknown {
 
   for (const [key, value] of Object.entries(obj)) {
     if (isPropertyMap) {
-      // 当前在 properties 字典中，key 是参数名，不能被当成 Schema 关键字过滤掉
       result[key] = sanitizeParameters(value, false)
       continue
     }
 
-    // 移除 Gemini 不支持的 Schema 字段
     if (
       key === '$schema' ||
       key === 'additionalProperties' ||
@@ -135,13 +132,11 @@ function sanitizeParameters(params: unknown, isPropertyMap = false): unknown {
       continue
     }
 
-    // 将 const 转换为 Gemini 支持的 enum
     if (key === 'const') {
-      result['enum'] =[value]
+      result['enum'] = [value]
       continue
     }
 
-    // 如果遇到了 properties 字段，它的值是一个字典，里面的 key 是参数名
     if (key === 'properties' && value !== null && typeof value === 'object' && !Array.isArray(value)) {
       result[key] = sanitizeParameters(value, true)
     } else {
@@ -174,7 +169,7 @@ function mapToolChoice(
     return {
       functionCallingConfig: {
         mode: 'ANY',
-        allowedFunctionNames: [toolChoice.name],
+        allowedFunctionNames:[toolChoice.name],
       },
     }
   }
@@ -202,7 +197,7 @@ function mapEffortToGeminiThinkingBudget(effort?: EffortValue): number | undefin
 function mapAnthropicUserBlocksToGeminiParts(blocks: AnyBlock[]): GeminiPart[] {
   return blocks.flatMap(block => {
     if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
-      return[{ text: block.text }]
+      return [{ text: block.text }]
     }
     if (
       block.type === 'image' &&
@@ -242,6 +237,11 @@ export function convertAnthropicRequestToGemini(input: {
   const configuredModel = process.env.ANTHROPIC_MODEL?.trim()
   void configuredModel
 
+  const thinkingBudget = mapEffortToGeminiThinkingBudget(input.effort)
+  const thinkingEnabled =
+    (input.thinking?.type === 'enabled' || input.thinking?.type === 'adaptive') &&
+    thinkingBudget !== 0
+
   if (input.system) {
     const systemText = Array.isArray(input.system)
       ? input.system.map(block => block.text ?? '').join('\n')
@@ -256,24 +256,44 @@ export function convertAnthropicRequestToGemini(input: {
     const blocks = toBlocks(message.content)
 
     if (message.role === 'user') {
-      const parts: GeminiPart[] =[]
+      const parts: GeminiPart[] = []
 
       for (const block of blocks as AnyBlock[]) {
         if (block.type === 'tool_result') {
           const toolUseId =
             typeof block.tool_use_id === 'string' ? block.tool_use_id : undefined
           const toolName = toolUseId ? toolNameById.get(toolUseId) : undefined
-          parts.push({
-            functionResponse: {
-              name: toolName,
-              response: {
-                content:
-                  typeof block.content === 'string'
-                    ? block.content
-                    : block.content ?? '',
+          
+          let contentStr = ''
+          if (typeof block.content === 'string') {
+            contentStr = block.content
+          } else if (Array.isArray(block.content)) {
+            contentStr = block.content
+              .map((b: any) => typeof b?.text === 'string' ? b.text : JSON.stringify(b))
+              .join('\n')
+          } else if (block.content !== undefined && block.content !== null) {
+            contentStr = String(block.content)
+          }
+
+          if (contentStr.length > 40000) {
+            contentStr = contentStr.slice(0, 40000) + '\n...[Truncated to prevent API error]'
+          }
+
+          if (toolName) {
+            parts.push({
+              functionResponse: {
+                name: toolName,
+                response: {
+                  content: contentStr,
+                  ...(block.is_error ? { error: true } : {})
+                },
               },
-            },
-          })
+            })
+          } else {
+            parts.push({
+              text: `[System: Tool execution result for ${toolUseId || 'unknown_tool'}]:\n${contentStr || 'Success'}`
+            })
+          }
         }
       }
 
@@ -294,18 +314,56 @@ export function convertAnthropicRequestToGemini(input: {
       ? (message.content as unknown as AnyBlock[])
       :[]
 
+    let currentSignature: string | undefined = undefined
+
     for (const block of assistantBlocks) {
+      if (block.type === 'thinking' && typeof block.thinking === 'string') {
+        currentSignature = typeof block.signature === 'string' ? block.signature : undefined
+        parts.push({
+          text: block.thinking,
+          thought: true,
+          ...(currentSignature ? { thoughtSignature: currentSignature } : {})
+        })
+        continue
+      }
+
+      if (block.type === 'redacted_thinking') {
+        currentSignature = typeof block.signature === 'string' ? block.signature : undefined
+        parts.push({
+          text: '[Redacted Thought]',
+          thought: true,
+          ...(currentSignature ? { thoughtSignature: currentSignature } : {})
+        })
+        continue
+      }
+
       if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
         parts.push({ text: block.text })
         continue
       }
 
       if (block.type === 'tool_use') {
+        let sig = currentSignature
+        
+        // 从被 Claude 截断保留的 ID 中恢复被删除的防伪签名
+        if (typeof block.id === 'string' && block.id.startsWith('toolu_gemini.')) {
+          const idParts = block.id.split('.')
+          if (idParts.length >= 3) {
+            const encodedSig = idParts[1]
+            if (encodedSig && encodedSig !== 'nosig') {
+              try {
+                sig = Buffer.from(encodedSig, 'hex').toString('utf8')
+              } catch {}
+            }
+          }
+        }
+
         parts.push({
           functionCall: {
             name: typeof block.name === 'string' ? block.name : undefined,
-            args: block.input ?? {},
+            args: typeof block.input === 'object' && block.input !== null ? block.input : {},
           },
+          ...(sig ? { thoughtSignature: sig } : (thinkingEnabled ? { thoughtSignature: "mock_signature" } : {}))
         })
       }
     }
@@ -315,23 +373,35 @@ export function convertAnthropicRequestToGemini(input: {
     }
   }
 
+  const mergedContents: GeminiContent[] =[]
+  for (const content of contents) {
+    const last = mergedContents[mergedContents.length - 1]
+    if (last && last.role === content.role) {
+      last.parts.push(...content.parts)
+    } else {
+      mergedContents.push({ role: content.role, parts: [...content.parts] })
+    }
+  }
+
+  if (mergedContents.length > 0 && mergedContents[0].role === 'model') {
+    mergedContents.unshift({
+      role: 'user',
+      parts: [{ text: '[System] Conversation context restored.' }]
+    })
+  }
+
   const systemText = input.system
     ? Array.isArray(input.system)
       ? input.system.map(block => block.text ?? '').join('\n')
       : input.system
     : ''
 
-  const thinkingBudget = mapEffortToGeminiThinkingBudget(input.effort)
-  const thinkingEnabled =
-    (input.thinking?.type === 'enabled' || input.thinking?.type === 'adaptive') &&
-    thinkingBudget !== 0
-
   return {
-    contents,
+    contents: mergedContents,
     ...(systemText.trim()
       ? {
           systemInstruction: {
-            parts: [{ text: systemText }],
+            parts:[{ text: systemText }],
           },
         }
       : {}),
@@ -418,6 +488,7 @@ export async function* createAnthropicStreamFromGemini(input: {
   let emittedAnyContent = false
   let stopReason: BetaMessage['stop_reason'] = 'end_turn'
   let toolCounter = 0
+  let lastSeenSignature = ''
 
   while (true) {
     const { done, value } = await input.reader.read()
@@ -464,6 +535,10 @@ export async function* createAnthropicStreamFromGemini(input: {
         const parts = candidate?.content?.parts ??[]
 
         for (const part of parts) {
+          if (typeof part.thoughtSignature === 'string' && part.thoughtSignature.length > 0) {
+            lastSeenSignature = part.thoughtSignature
+          }
+
           if (typeof part.text === 'string' && part.text.length > 0 && part.thought) {
             if (!thinkingStarted) {
               thinkingStarted = true
@@ -522,12 +597,17 @@ export async function* createAnthropicStreamFromGemini(input: {
             const anthropicIndex = nextContentIndex
             nextContentIndex += 1
             toolCounter += 1
+            
+            // 将防伪签名转换为 Hex，偷渡藏在分配给工具的 ID 中
+            const encodedSig = lastSeenSignature ? Buffer.from(lastSeenSignature, 'utf8').toString('hex') : 'nosig'
+            const toolId = `toolu_gemini.${encodedSig}.${toolCounter}`
+
             yield {
               type: 'content_block_start',
               index: anthropicIndex,
               content_block: {
                 type: 'tool_use',
-                id: `toolu_gemini_${toolCounter}`,
+                id: toolId,
                 name: part.functionCall.name ?? '',
                 input: '',
               },
